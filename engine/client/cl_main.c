@@ -599,7 +599,7 @@ static void CL_CreateCmd( void )
 	int       input_override;
 	int       i, ms;
 
-	if( cls.state < ca_connected || cls.state == ca_cinematic )
+	if( cls.state <= ca_connected || cls.state == ca_cinematic )
 		return;
 
 	// store viewangles in case it's will be freeze
@@ -680,21 +680,16 @@ static void CL_CreateCmd( void )
 
 void CL_WriteUsercmd( sizebuf_t *msg, int from, int to )
 {
-	usercmd_t	nullcmd;
+	const usercmd_t nullcmd = { 0 };
 	usercmd_t	*f, *t;
 
 	Assert( from == -1 || ( from >= 0 && from < MULTIPLAYER_BACKUP ));
 	Assert( to >= 0 && to < MULTIPLAYER_BACKUP );
 
 	if( from == -1 )
-	{
-		memset( &nullcmd, 0, sizeof( nullcmd ));
 		f = &nullcmd;
-	}
 	else
-	{
 		f = &cl.commands[from].cmd;
-	}
 
 	t = &cl.commands[to].cmd;
 
@@ -737,8 +732,15 @@ static void CL_WritePacket( void )
 	MSG_Init( &buf, "ClientData", data, sizeof( data ));
 
 	// Determine number of backup commands to send along
-	numbackup = bound( 0, cl_cmdbackup.value, cls.legacymode ? MAX_LEGACY_BACKUP_CMDS : MAX_BACKUP_COMMANDS );
-	if( cls.state == ca_connected ) numbackup = 0;
+	if( cls.legacymode == PROTO_GOLDSRC )
+		numbackup = bound( 0, cl_cmdbackup.value, MAX_GOLDSRC_BACKUP_CMDS );
+	else if( cls.legacymode == PROTO_LEGACY )
+		numbackup = bound( 0, cl_cmdbackup.value, MAX_LEGACY_BACKUP_CMDS );
+	else
+		numbackup = bound( 0, cl_cmdbackup.value, MAX_BACKUP_COMMANDS );
+
+	if( cls.state == ca_connected )
+		numbackup = 0;
 
 	// clamp cmdrate
 	if( cl_cmdrate.value < 10.0f )
@@ -805,14 +807,14 @@ static void CL_WritePacket( void )
 		MSG_BeginClientCmd( &buf, clc_move );
 
 		if( cls.legacymode == PROTO_GOLDSRC )
-			MSG_WriteByte( &buf, 0 );
+			MSG_WriteByte( &buf, 0 ); // length
 
 		// save the position for a checksum byte
 		key = MSG_GetRealBytesWritten( &buf );
 		MSG_WriteByte( &buf, 0 );
 
 		// write packet lossage percentation
-		MSG_WriteByte( &buf, cls.packet_loss );
+		MSG_WriteByte( &buf, bound( 0, (int)cls.packet_loss, 100 ) );
 
 		// say how many backups we'll be sending
 		MSG_WriteByte( &buf, numbackup );
@@ -821,8 +823,15 @@ static void CL_WritePacket( void )
 		newcmds = ( cls.netchan.outgoing_sequence - cls.lastoutgoingcommand );
 
 		// put an upper/lower bound on this
-		newcmds = bound( 0, newcmds, cls.legacymode ? MAX_LEGACY_TOTAL_CMDS: MAX_TOTAL_CMDS );
-		if( cls.state == ca_connected ) newcmds = 0;
+		if( cls.legacymode == PROTO_GOLDSRC )
+			newcmds = bound( 0, newcmds, MAX_GOLDSRC_TOTAL_CMDS );
+		else if( cls.legacymode == PROTO_LEGACY )
+			newcmds = bound( 0, newcmds, MAX_LEGACY_TOTAL_CMDS );
+		else
+			newcmds = bound( 0, newcmds, MAX_TOTAL_CMDS );
+
+		if( cls.state == ca_connected )
+			newcmds = 0;
 
 		MSG_WriteByte( &buf, newcmds );
 
@@ -843,16 +852,20 @@ static void CL_WritePacket( void )
 		}
 
 		// calculate a checksum over the move commands
-		size = MSG_GetRealBytesWritten( &buf ) - key - 1;
 		if( cls.legacymode == PROTO_GOLDSRC )
 		{
-			size = Q_min( size, 255 );
-			buf.pData[key - 1] = size;
-		}
-		buf.pData[key] = CRC32_BlockSequence( buf.pData + key + 1, size, cls.netchan.outgoing_sequence );
+			size = MSG_GetRealBytesWritten( &buf ) - key - 1;
 
-		if( cls.legacymode == PROTO_GOLDSRC )
-			COM_Munge( buf.pData + key + 1, size, cls.netchan.outgoing_sequence );
+			buf.pData[key - 1] = Q_min( size, 255 );
+			buf.pData[key] = CRC32_BlockSequence( buf.pData + key + 1, size, cls.netchan.outgoing_sequence );
+			COM_Munge( buf.pData + key + 1, Q_min( size, 255 ), cls.netchan.outgoing_sequence );
+		}
+		else
+		{
+			size = MSG_GetRealBytesWritten( &buf ) - key - 1;
+
+			buf.pData[key] = CRC32_BlockSequence( buf.pData + key + 1, size, cls.netchan.outgoing_sequence );
+		}
 
 		// message we are constructing.
 		i = cls.netchan.outgoing_sequence & CL_UPDATE_MASK;
@@ -1022,6 +1035,22 @@ void CL_Drop( void )
 	CL_Disconnect();
 }
 
+static void CL_GetCDKey( char *protinfo, size_t protinfosize )
+{
+	byte hash[16] = { 0 };
+	MD5Context_t ctx = { 0 };
+	char key[64];
+	int keylength;
+
+	keylength = Q_snprintf( key, sizeof( key ), "%u", COM_RandomLong( 0, 0x7fffffff ));
+
+	MD5Init( &ctx );
+	MD5Update( &ctx, key, keylength );
+	MD5Final( hash, &ctx );
+
+	Info_SetValueForKey( protinfo, "cdkey", MD5_Print( hash ), protinfosize );
+}
+
 /*
 =======================
 CL_SendConnectPacket
@@ -1083,9 +1112,7 @@ static void CL_SendConnectPacket( void )
 
 		Info_SetValueForKey( protinfo, "prot", "3", sizeof( protinfo )); // steam auth type
 		Info_SetValueForKey( protinfo, "raw", "steam", sizeof( protinfo ));
-		Info_SetValueForKey( protinfo, "cdkey", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sizeof( protinfo ));
-
-		Info_SetValueForStarKey( cls.userinfo, "*hltv", "0", sizeof( cls.userinfo ));
+		CL_GetCDKey( protinfo, sizeof( protinfo ));
 
 		MSG_Init( &send, "GoldSrcConnect", send_buf, sizeof( send_buf ));
 		MSG_WriteLong( &send, NET_HEADER_OUTOFBANDPACKET );
@@ -1188,7 +1215,7 @@ static void CL_CheckForResend( void )
 	else if( cl_resend.value > CL_MAX_RESEND_TIME )
 		Cvar_SetValue( "cl_resend", CL_MAX_RESEND_TIME );
 
-	bandwidthTest = !cls.legacymode && cl_test_bandwidth.value && cls.connect_retry <= CL_TEST_RETRIES;
+	bandwidthTest = cls.legacymode == PROTO_CURRENT && cl_test_bandwidth.value && cls.connect_retry <= CL_TEST_RETRIES;
 	resendTime = bandwidthTest ? 1.0f : cl_resend.value;
 
 	if(( host.realtime - cls.connect_time ) < resendTime )
@@ -2137,6 +2164,14 @@ static void CL_ConnectionlessPacket( netadr_t from, sizebuf_t *msg )
 		Cbuf_AddText( args );
 		Cbuf_AddText( "\n" );
 	}
+	else if( c[0] == 'l' )
+	{
+		char *s = args + 1;
+
+		Con_Printf( S_CYAN "r:" S_DEFAULT " %s", s );
+		if( !COM_CheckStringEmpty( s ) || s[Q_strlen( s ) - 1] != '\n' )
+			Con_Printf( "\n" );
+	}
 	else if( !Q_strcmp( c, "print" ))
 	{
 		// print command from somewhere
@@ -2663,10 +2698,11 @@ void CL_ProcessFile( qboolean successfully_received, const char *filename )
 		Con_Printf( S_ERROR "server failed to transmit file '%s'\n", CL_CleanFileName( filename ));
 	}
 
-	if( cls.legacymode )
+	if( cls.legacymode == PROTO_LEGACY )
 	{
 		if( host.downloadcount > 0 )
 			host.downloadcount--;
+
 		if( !host.downloadcount )
 		{
 			MSG_WriteByte( &cls.netchan.message, clc_stringcmd );
