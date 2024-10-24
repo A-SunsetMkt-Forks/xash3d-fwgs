@@ -17,10 +17,6 @@ def options(opt):
 	return
 
 def configure(conf):
-	# check for dedicated server build
-	if conf.options.DEDICATED:
-		return
-
 	conf.define_cond('SUPPORT_BSP2_FORMAT', conf.options.SUPPORT_BSP2_FORMAT)
 
 	conf.env.GL_STATIC = conf.options.GL_STATIC
@@ -76,7 +72,6 @@ def build(bld):
 
 		bld.shlib(source = source,
 			target = k,
-			features = 'c',
 			includes = includes,
 			use = libs + v['libs'],
 			defines = v['defines'],
